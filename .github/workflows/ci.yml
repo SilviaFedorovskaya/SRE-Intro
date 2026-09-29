@@ -22,15 +22,15 @@ jobs:
 
       - name: Build and push gateway
         run: |
-          docker build -t ghcr.io/silviafedorovskaya/quickticket-gateway:latest ./app/gateway
-          docker push ghcr.io/silviafedorovskaya/quickticket-gateway:latest
+          docker build -t ghcr.io/silviafedorovskaya/quickticket-gateway:${{ github.sha }} ./app/gateway
+          docker push ghcr.io/silviafedorovskaya/quickticket-gateway:${{ github.sha }}
 
       - name: Build and push events
         run: |
-          docker build -t ghcr.io/silviafedorovskaya/quickticket-events:latest ./app/events
-          docker push ghcr.io/silviafedorovskaya/quickticket-events:latest
+          docker build -t ghcr.io/silviafedorovskaya/quickticket-events:${{ github.sha }} ./app/events
+          docker push ghcr.io/silviafedorovskaya/quickticket-events:${{ github.sha }}
 
       - name: Build and push payments
         run: |
-          docker build -t ghcr.io/silviafedorovskaya/quickticket-payments:latest ./app/payments
-          docker push ghcr.io/silviafedorovskaya/quickticket-payments:latest
+          docker build -t ghcr.io/silviafedorovskaya/quickticket-payments:${{ github.sha }} ./app/payments
+          docker push ghcr.io/silviafedorovskaya/quickticket-payments:${{ github.sha }}
