@@ -12,10 +12,12 @@ spec:
       labels:
         app: gateway
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: gateway
-          image: quickticket-gateway:v1
-          imagePullPolicy: Never
+          image: ghcr.io/silviafedorovskaya/quickticket-gateway:2d1a803a0cf9dc3c7ec64bb2523e5bd385a53861
+          imagePullPolicy: IfNotPresent
           resources:
             requests:
               cpu: "100m"

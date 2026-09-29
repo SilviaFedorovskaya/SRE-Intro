@@ -12,6 +12,8 @@ spec:
       labels:
         app: events
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: events
           image: quickticket-events:v1

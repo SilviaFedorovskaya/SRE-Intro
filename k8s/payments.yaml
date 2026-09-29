@@ -12,6 +12,8 @@ spec:
       labels:
         app: payments
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: payments
           image: quickticket-payments:v1
