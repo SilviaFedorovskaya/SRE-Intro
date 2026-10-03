@@ -10,7 +10,11 @@ spec:
         - setWeight: 20
         - analysis:
             templates:
-              - templateName: gateway-success-rate
+              - templateName: gateway-error-rate
+            args:
+              - name: canary-hash
+                valueFrom:
+                  podTemplateHashValue: Latest
         - pause:
             duration: 60s
         - setWeight: 40
@@ -28,6 +32,8 @@ spec:
       app: gateway
   template:
     metadata:
+      annotations:
+        abort-test: "1"
       labels:
         app: gateway
     spec:
@@ -46,7 +52,7 @@ spec:
               memory: "256Mi"
           env:
             - name: APP_VERSION
-              value: "v2-analysis"
+              value: "v2-abort-test"
             - name: EVENTS_URL
               value: "http://events:8081"
             - name: PAYMENTS_URL
