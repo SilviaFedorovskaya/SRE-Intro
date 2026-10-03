@@ -1,0 +1,16 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: gateway-success-rate
+spec:
+  metrics:
+    - name: gateway-up
+      interval: 10s
+      count: 3
+      successCondition: result[0] > 0
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(up{job="gateway"}) > 0
