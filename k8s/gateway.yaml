@@ -37,6 +37,14 @@ spec:
       labels:
         app: gateway
     spec:
+      terminationGracePeriodSeconds: 40
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gateway
       imagePullSecrets:
         - name: ghcr-secret
       containers:
@@ -77,6 +85,10 @@ spec:
               value: "0.5"
           ports:
             - containerPort: 8080
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
           readinessProbe:
             httpGet:
               path: /health
