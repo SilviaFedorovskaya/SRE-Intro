@@ -1,348 +1,382 @@
 # Lab 6 — Alerting & Incident Response
 
-![difficulty](https://img.shields.io/badge/difficulty-intermediate-yellow)
-![topic](https://img.shields.io/badge/topic-Alerting%20%26%20Incidents-blue)
-![points](https://img.shields.io/badge/points-10%2B2-orange)
-![tech](https://img.shields.io/badge/tech-Grafana%20Alerting-informational)
+**Branch:** `feature/lab6`  
+**Date:** 2026-10-25  
+**Environment:** QuickTicket Docker Compose, Prometheus, Grafana  
+**SLO target:** 99.5% availability  
+**Scope:** Grafana alerting, controlled Payments failure, recovery, and Redis runbook validation.
 
-> **Goal:** Create SLO-based alerts in Grafana, simulate an incident, follow your own runbook, and write a blameless postmortem.
-> **Deliverable:** A PR from `feature/lab6` with `submissions/lab6.md` containing alert configs, runbook, and postmortem. Submit PR link via Moodle.
-
----
-
-## Overview
-
-In this lab you will practice:
-- Creating alert rules in Grafana based on SLO burn rates
-- Configuring notification channels (contact points)
-- Writing a runbook for your alert
-- Injecting a failure and responding using your runbook
-- Writing a blameless postmortem
-
-> **You write everything.** Alert rules, runbook, postmortem — all created by you. The only thing provided is the monitoring stack from Lab 3.
+> **Evidence note.** This report records observed results from the test session. Exact wall-clock timestamps for every incident milestone were not captured at the time, so they are not invented below. Screenshots from Grafana/Prometheus and terminal output should be committed or attached separately if required by the course.
 
 ---
 
-## Project State
+## 1. Summary of work completed
 
-**You should have from previous labs:**
-- QuickTicket on k3d with monitoring (Prometheus + Grafana)
-- SLOs defined (99.5% availability from Lab 3)
+- Configured Grafana contact point `quickticket-alerts` using a Webhook receiver and successfully sent a test notification.
+- Set the default notification policy to use `quickticket-alerts`, group by `alertname`, wait `30s` before the first notification, and repeat every `5m`.
+- Created two Grafana-managed alert rules: `QuickTicket High Error Rate` and `QuickTicket SLO Burn Rate`.
+- Injected a controlled Payments failure with `PAYMENT_FAILURE_RATE=0.5`, generated payment requests, observed HTTP 500 responses and the High Error Rate alert entering `Firing`, then restored Payments and observed the alert return to `Normal`.
+- Tested the second runbook scenario by stopping Redis, observing the Events health check degrade and reservation requests fail, then starting Redis and verifying recovery.
+- Wrote the second runbook at `submissions/runbooks/redis-down.md`.
+- The independent classmate test for the bonus was **not performed**; no peer-test result is claimed.
 
-**This lab adds:**
-- Grafana alert rules that fire when SLOs are threatened
-- A runbook for responding to alerts
-- Your first blameless postmortem
+## 2. Environment and monitoring configuration
 
----
-
-## Task 1 — Create Alerts & Respond to an Incident (6 pts)
-
-**Objective:** Set up SLO-based alerting, inject a failure, detect it via alert, and resolve it.
-
-### 6.1: Start the full stack
+The stack was started from `app/` using the application Compose file and monitoring overlay:
 
 ```bash
-cd app/
 docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml up -d --build
 ```
 
-Generate background traffic so metrics are populated:
+The Postgres host port was mapped to `5433:5432` to avoid a conflict with a service already using host port `5432`.
 
-```bash
-./loadgen/run.sh 3 300 &
+Prometheus scrape configuration is in `monitoring/prometheus/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 5s
+  evaluation_interval: 1m
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["prometheus:9090"]
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8080"]
+  - job_name: events
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["events:8081"]
+  - job_name: payments
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["payments:8082"]
 ```
 
-### 6.2: Create a contact point
+During validation, Prometheus `/targets` showed the Prometheus, Gateway, Events, and Payments targets as `UP`.
 
-In Grafana (`http://localhost:3000`), go to **Alerting → Contact points → Add contact point**:
+### Useful local endpoints
 
-- **Name:** `quickticket-alerts`
-- **Type:** Webhook (simplest — sends JSON POST to a URL)
-- **URL:** Use a free webhook receiver like https://webhook.site (gives you a unique URL to see notifications)
+| Component | Endpoint |
+|---|---|
+| Grafana | `http://localhost:3000` |
+| Prometheus | `http://localhost:9090` |
+| Gateway | `http://localhost:3080` |
+| Events | `http://localhost:8081` |
+| Payments | `http://localhost:8082` |
 
-Alternatively, if you have Discord/Slack: use the corresponding integration.
+## 3. Grafana contact point and notification policy
 
-Test the contact point — click "Test" and verify you receive a notification.
+**Contact point:** `quickticket-alerts`  
+**Integration:** Webhook  
+**Test result:** Grafana displayed `Test notification sent successfully` after sending a test notification to the configured Webhook receiver.
 
-### 6.3: Create alert rules
+**Default notification policy:**
 
-Go to **Alerting → Alert rules → New alert rule**.
+| Setting | Value |
+|---|---|
+| Default contact point | `quickticket-alerts` |
+| Group by | `alertname` |
+| Group wait | `30s` |
+| Repeat interval | `5m` |
 
-**Alert 1 — High Error Rate (critical):**
+The configured contact point was also shown on the SLO Burn Rate rule details page as the notification destination (`lab6-webhook` in the displayed UI). The contact point was tested successfully; the evidence available from the session confirms the test-send success, not a retained copy of every incident notification payload.
+
+## 4. Alert rule configurations
+
+### 4.1 QuickTicket High Error Rate
+
+**Type:** Grafana-managed  
+**Severity:** `critical`  
+**Evaluation interval:** `1m`  
+**Pending period:** `2m`  
+**Condition:** above `5` (percentage points)
+
+The base query specified in the lab is:
+
+```promql
+sum(rate(gateway_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(gateway_requests_total[5m]))
+* 100
+```
+
+To avoid a missing numerator being treated as an empty result when there are no 5xx samples, the working rule used this equivalent defensive numerator:
+
+```promql
+(
+  sum(rate(gateway_requests_total{status=~"5.."}[5m])) or vector(0)
+)
+/
+sum(rate(gateway_requests_total[5m]))
+* 100
+```
+
+**Annotations:**
+
+- Summary: `Gateway error rate is {{ $value }}%`
+- Description: `Error rate exceeded 5% for 2 minutes. Check payments service health.`
+
+**Observed result:** The rule was observed in `Firing` during the controlled Payments failure and returned to `Normal` after Payments was restored. A Grafana screenshot from the session showed the `Firing` state; a later check showed `Normal`.
+
+### 4.2 QuickTicket SLO Burn Rate
+
+**Type:** Grafana-managed  
+**Severity:** `warning`  
+**Evaluation interval:** `1m`  
+**Pending period:** `5m`  
+**Condition:** above `6`
+
+```promql
+(
+  1 - (
+    sum(rate(gateway_requests_total{status!~"5.."}[30m]))
+    /
+    sum(rate(gateway_requests_total[30m]))
+  )
+)
+/
+(1 - 0.995)
+```
+
+The query uses the 99.5% availability SLO: the observed error ratio is divided by the allowed error ratio (`1 - 0.995`). A burn rate greater than `6` breaches the configured threshold.
+
+**Observed result:** The rule details page showed the expression and threshold condition `Is above 6`, an evaluation interval of every `1m`, and the rule in `Normal` at the time of inspection. Prometheus graph results for this expression showed values around `35`, `75`, and `180` during periods in which data was present. The Grafana history also contained `No data`, `Pending (Nodata)`, `Normal (Missingseries)`, and `Error` entries. These intermittent states are documented as a reliability limitation to investigate; they are not represented as a consistently firing alert.
+
+## 5. Incident runbook — High Error Rate
+
+### Alert
+
 - **Name:** `QuickTicket High Error Rate`
-- **Type:** Grafana-managed
-- **Query A (PromQL):**
-  ```promql
-  sum(rate(gateway_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_requests_total[5m])) * 100
-  ```
-- **Condition:** IS ABOVE `5` (5% error rate)
-- **Evaluation:** every 1m, for 2m (pending period — must be true for 2 min before firing)
-- **Labels:** `severity=critical`
-- **Annotations:**
-  - Summary: `Gateway error rate is {{ $value }}%`
-  - Description: `Error rate exceeded 5% for 2 minutes. Check payments service health.`
+- **Fires when:** Gateway 5xx error rate is greater than 5% for the configured pending period of 2 minutes.
+- **Dashboard/tooling:** Grafana alert rule details and Prometheus metrics.
 
-**Alert 2 — SLO Burn Rate (warning):**
-- **Name:** `QuickTicket SLO Burn Rate`
-- **Query A:**
-  ```promql
-  (1 - (sum(rate(gateway_requests_total{status!~"5.."}[30m])) / sum(rate(gateway_requests_total[30m])))) / (1 - 0.995)
-  ```
-- **Condition:** IS ABOVE `6` (6x burn rate — will exhaust 30-day budget in 5 days)
-- **Evaluation:** every 1m, for 5m
-- **Labels:** `severity=warning`
+### Diagnosis
 
-### 6.4: Configure notification policy
-
-Go to **Alerting → Notification policies**. Edit the default policy:
-- **Default contact point:** `quickticket-alerts`
-- **Group by:** `alertname`
-- **Group wait:** 30s (wait before first notification)
-- **Repeat interval:** 5m
-
-### 6.5: Write a runbook
-
-Create a runbook for the "High Error Rate" alert. Use this structure:
-
-```markdown
-# Runbook: QuickTicket High Error Rate
-
-## Alert
-- **Fires when:** Gateway 5xx error rate > 5% for 2 minutes
-- **Dashboard:** QuickTicket — Golden Signals
-
-## Diagnosis
-1. Check which service is failing:
-   - `curl -s http://localhost:3080/health | python3 -m json.tool`
-2. Check payments service directly:
-   - `curl -s http://localhost:8082/health`
-3. Check events service:
-   - `curl -s http://localhost:8081/health`
-4. Check logs for errors:
-   - `docker compose logs gateway --tail=20 --since=5m`
-   - `docker compose logs payments --tail=20 --since=5m`
-
-## Common Causes
-| Cause | How to identify | Fix |
-|-------|----------------|-----|
-| Payments service down | health shows payments: down | Restart: `docker compose start payments` |
-| Payments high failure rate | health OK but errors in logs | Check PAYMENT_FAILURE_RATE env var |
-| Events service down | health shows events: down | Restart: `docker compose start events` |
-| Database connection exhausted | events logs show pool errors | Restart events, check DB_MAX_CONNS |
-
-## Escalation
-- If not resolved in 10 minutes, escalate to: [instructor/TA]
-```
-
-Save this in `submissions/lab6.md` as part of your submission.
-
-### 6.6: Inject failure and respond
-
-Now simulate a real incident. Inject payment failures:
+Run these commands from `app/`:
 
 ```bash
-# Stop payments and restart with 50% failure rate
-docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml stop payments
-PAYMENT_FAILURE_RATE=0.5 docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml up -d payments
+curl -s http://localhost:3080/health | python3 -m json.tool
+curl -s http://localhost:8082/health
+curl -s http://localhost:8081/health
+docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml logs gateway --tail=20 --since=5m
+docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml logs payments --tail=20 --since=5m
 ```
 
-**Now respond as if this is a real incident:**
+Check the Gateway and Payments health endpoints, inspect recent logs, and confirm whether payment requests are returning 5xx responses.
 
-1. Wait for the alert to fire (check Grafana Alerting → Alert rules — status should change to "Firing")
-2. Check your webhook/Discord/Slack — did the notification arrive?
-3. Follow your runbook step by step — diagnose, identify the cause, fix it
-4. Fix: restore normal payments:
-   ```bash
-   docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml stop payments
-   PAYMENT_FAILURE_RATE=0.0 docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml up -d payments
+### Common causes and mitigation
+
+| Possible cause | Evidence to inspect | Mitigation |
+|---|---|---|
+| Payments service stopped | Payments health check and Compose status | Start/recreate Payments and verify health |
+| Payments failure rate elevated | Payments health response and `PAYMENT_FAILURE_RATE` configuration | Restore `PAYMENT_FAILURE_RATE=0.0`, recreate Payments, retest |
+| Events service unavailable | Events health check and Events logs | Restore Events and verify Postgres/Redis dependencies |
+| Database connection issue | Events logs and health checks | Investigate DB connectivity and pool configuration before restarting |
+
+### Escalation
+
+If the error rate does not recover within 10 minutes, preserve logs and alert-state evidence and escalate to the instructor/TA.
+
+## 6. Incident simulation and observed metrics
+
+### Failure injection
+
+Payments was recreated with a 50% configured failure rate. From `app/`, the test command was:
+
+```bash
+PAYMENT_FAILURE_RATE=0.5 docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml up -d --force-recreate payments
+```
+
+The Payments health endpoint confirmed the configuration:
+
+```json
+{"status":"healthy","failure_rate":0.5,"latency_ms":0}
+```
+
+Payment requests were generated against valid reservations. In one batch of ten requests, **4 returned HTTP 500 and 6 returned HTTP 200**. Additional repeated requests against a reservation were used to generate enough 5xx traffic for the alert test. The Gateway metrics endpoint showed the following observed counters at that point:
+
+| Gateway route/status series | Observed count |
+|---|---:|
+| `/health`, status `200` | 36 |
+| `/orders`, status `404` | 1 |
+| `/events`, status `200` | 1 |
+| `/events/{id}/reserve`, status `409` | 1 |
+| `/events/{id}/reserve`, status `200` | 11 |
+| `/reserve/{reservation_id}/pay`, status `200` | 7 |
+| `/reserve/{reservation_id}/pay`, status `500` | 4 |
+
+These are counters observed during the test session, not a clean isolated benchmark; counts may include earlier requests in the running stack.
+
+The Prometheus error-rate query reached **100%** during a repeated-error test window. Grafana showed `QuickTicket High Error Rate` as `Firing`. After the failure rate was reset, the rule later returned to `Normal`.
+
+### Recovery
+
+Payments was restored using:
+
+```bash
+PAYMENT_FAILURE_RATE=0.0 docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml up -d --force-recreate payments
+```
+
+The health endpoint then returned:
+
+```json
+{"status":"healthy","failure_rate":0.0,"latency_ms":0}
+```
+
+A subsequent Grafana check showed the High Error Rate alert in `Normal`.
+
+### Timeline and alert-delay answer
+
+Exact timestamps for injection, first alert firing, diagnosis, fix, and resolution were not recorded as a complete timestamped sequence during the experiment. To avoid fabricating evidence, the timeline is recorded as observed order rather than invented clock times:
+
+| Order | Event | Evidence/result |
+|---:|---|---|
+| 1 | Payments recreated with `PAYMENT_FAILURE_RATE=0.5` | Health endpoint reported `failure_rate: 0.5` |
+| 2 | Payment requests generated | Batch showed 4 HTTP 500 and 6 HTTP 200; Gateway metrics showed 5xx counter activity |
+| 3 | Error-rate metric queried | Prometheus error-rate query reached 100% during repeated-error testing |
+| 4 | Alert observed | `QuickTicket High Error Rate` shown as `Firing` in Grafana |
+| 5 | Payments restored with `PAYMENT_FAILURE_RATE=0.0` | Health endpoint reported `failure_rate: 0.0` |
+| 6 | Recovery confirmed | Grafana High Error Rate alert shown as `Normal` |
+
+**Answer: “How long from failure injection to alert firing? Why the delay?”**
+
+The exact elapsed time cannot be established from the retained evidence because the injection and firing timestamps were not recorded together. The configured alert has a `2m` pending period and evaluates every `1m`, so a continuously breached condition is expected to fire after roughly 2–3 minutes, depending on where the failure falls relative to an evaluation cycle. Metric collection and the 5-minute `rate()` window also affect how quickly the query reflects new traffic.
+
+## 7. Blameless postmortem
+
+**Incident:** Controlled Payments failure-rate test  
+**Date:** 2026-10-25  
+**Duration:** Exact start/end duration not captured; test ran until Payments was restored and the alert returned to `Normal`  
+**Severity:** SEV-3 (controlled, non-production lab exercise; no real customer impact)  
+**Author:** Lab participant
+
+### Summary
+
+A controlled failure-rate increase in the Payments service caused payment requests to return HTTP 500 errors. Prometheus recorded 5xx activity, the Gateway High Error Rate alert entered `Firing`, and the service was restored by returning the configured failure rate to zero. The alert subsequently returned to `Normal`.
+
+### Timeline
+
+| Sequence | Event |
+|---:|---|
+| 1 | Set Payments failure rate to `0.5` and recreated the service |
+| 2 | Confirmed configured failure rate using `/health` |
+| 3 | Generated payment requests; observed HTTP 500 responses and increased 5xx metrics |
+| 4 | Observed `QuickTicket High Error Rate` in `Firing` |
+| 5 | Recreated Payments with failure rate `0.0` |
+| 6 | Confirmed healthy Payments endpoint and `Normal` alert state |
+
+Exact clock times were not retained, so sequence is provided instead of fabricated timestamps.
+
+### Root cause
+
+The controlled Payments configuration deliberately introduced a 50% failure probability for charge requests. Gateway propagated unsuccessful payment responses as 5xx responses, increasing the measured Gateway error rate. The incident was made visible by the High Error Rate alert. This was an intentional test injection, not an accidental production failure.
+
+### What went well
+
+- The Payments health endpoint exposed the configured failure rate.
+- Gateway metrics made the 5xx responses observable in Prometheus.
+- The High Error Rate alert entered `Firing` during the injected failure.
+- Restoring the failure rate to zero returned Payments to a healthy state, and the alert later returned to `Normal`.
+- The contact point's test notification succeeded.
+
+### What could be improved
+
+- A timestamped incident log should be started at injection and updated at every response milestone.
+- The SLO Burn Rate rule showed intermittent `No data`, `Missingseries`, and `Error` states, which should be investigated and tested under steady traffic.
+- The notification payload for the actual firing event should be captured, not only the contact-point test result.
+- The runbook should include a clear evidence checklist for alert firing and recovery.
+
+### Action items
+
+| Action | Owner | Priority | Status |
+|---|---|---|---|
+| Capture injection, firing, diagnosis, fix, and resolution timestamps in the next test | Lab participant | High | Open |
+| Investigate SLO Burn Rate `No data`/`Missingseries`/`Error` history under low or absent traffic | Lab participant | High | Open |
+| Save a screenshot/export of the actual incident notification payload | Lab participant | Medium | Open |
+| Keep the Payments runbook steps for checking health, logs, failure-rate configuration, and recovery verification | Lab participant | Medium | Runbook documented |
+
+**Most important action item and why:** Investigate and stabilize the SLO Burn Rate rule's intermittent `No data`/`Missingseries`/`Error` states. An alert that does not evaluate consistently may fail to warn reliably about SLO risk, even when its PromQL expression returns values during active traffic.
+
+## 8. Second runbook — Redis unavailable
+
+The second runbook is stored separately at `submissions/runbooks/redis-down.md`.
+
+### Test procedure and observations
+
+The test was performed with the same local Compose stack.
+
+1. Before the test, `http://localhost:8081/health` returned:
+
+   ```json
+   {"status":"healthy","checks":{"postgres":"ok","redis":"ok"}}
    ```
-5. Wait for the alert to resolve (status → "Normal")
 
-**Record timestamps** for everything — you need them for the postmortem.
+2. Redis was stopped:
 
-### 6.7: Proof of work
+   ```bash
+   docker compose -f app/docker-compose.yaml -f docker-compose.monitoring.yaml stop redis
+   ```
 
-**Paste into `submissions/lab6.md`:**
-1. Your alert rule PromQL queries (both rules)
-2. Contact point type and evidence of notification received (webhook URL output or screenshot)
-3. Your runbook (full text)
-4. Alert firing evidence: Grafana alert rule status showing "Firing"
-5. Timeline: when you injected → when alert fired → when you diagnosed → when you fixed → when alert resolved
-6. Answer: "How long from failure injection to alert firing? Why the delay?"
+3. Events health changed to:
 
-<details>
-<summary>💡 Hints</summary>
+   ```json
+   {"status":"degraded","checks":{"postgres":"ok","redis":"down"}}
+   ```
 
-- Alert "pending period" means it must be true for N minutes before firing — a 2-min pending period + 1-min evaluation = ~3 min from failure to alert
-- Webhook.site gives you a free URL: visit the site, copy your unique URL, paste as contact point
-- If "No data" in alert query — ensure loadgen is running and metrics are flowing
-- The SLO burn rate query uses 30m window — it needs 30 min of data to evaluate properly. Start with the error rate alert first (faster to test)
-- `PAYMENT_FAILURE_RATE=0.5` means 50% of charge requests fail — but charges are only ~10% of traffic, so overall error rate is ~1-2%, not 50%! You may need to **lower your threshold** or kill payments entirely to trigger the alert. This threshold tuning is a real SRE skill.
+4. A reservation request through Gateway failed with HTTP `504` and response:
 
-</details>
+   ```json
+   {"detail":"Events service timeout"}
+   ```
 
----
+5. Redis was restarted:
 
-## Task 2 — Blameless Postmortem (4 pts)
+   ```bash
+   docker compose -f app/docker-compose.yaml -f docker-compose.monitoring.yaml start redis
+   ```
 
-> ⏭️ This task is optional. Skipping it will not affect future labs.
+6. Events health returned to `healthy` with both Postgres and Redis checks `ok`. A new reservation request then returned HTTP `200` with a reservation ID, `event_id: 3`, `quantity: 1`, `total_cents: 15000`, and `expires_in_seconds: 300`.
 
-**Objective:** Write a blameless postmortem for the incident you just simulated.
+### Bonus status
 
-### 6.8: Write the postmortem
+The failure injection and recovery path were tested by the author, and the second runbook documents the procedure and observed results. **A classmate did not independently test this runbook**, so the peer-test requirement and feedback-based update are not claimed as completed.
 
-Use this structure:
+## 9. Evidence checklist
 
-```markdown
-# Postmortem: [Incident Title]
+Attach or commit the actual screenshots/outputs available from the test session. Do not replace them with fabricated screenshots.
 
-**Date:** [date]
-**Duration:** [start → end]
-**Severity:** SEV-[1-4]
-**Author:** [your name]
+- [x] Grafana list shows `QuickTicket High Error Rate` and `QuickTicket SLO Burn Rate`.
+- [x] High Error Rate rule observed in `Firing` during the Payments failure.
+- [x] High Error Rate rule later observed in `Normal` after recovery.
+- [x] SLO Burn Rate rule details show PromQL, condition above `6`, evaluation every `1m`, and `Normal` at inspection time.
+- [x] Prometheus graph shows SLO burn-rate query values around `35`, `75`, and `180` during periods with data.
+- [x] Contact point test reported `Test notification sent successfully`.
+- [x] Payments health response recorded both `failure_rate: 0.5` during injection and `failure_rate: 0.0` after recovery.
+- [x] Redis-down test recorded degraded health and HTTP `504`; after Redis restart, health recovered and reservation returned HTTP `200`.
+- [ ] Exact timestamps for every incident milestone — not captured.
+- [ ] Captured actual incident webhook payload — not retained in the evidence available for this report.
+- [ ] Independent peer test and feedback — not performed.
 
-## Summary
-[1-2 sentences: what happened and impact]
+## 10. Files included in the submission
 
-## Timeline
-| Time | Event |
-|------|-------|
-| HH:MM | [failure injected / first symptom] |
-| HH:MM | [alert fired] |
-| HH:MM | [investigation started] |
-| HH:MM | [root cause identified] |
-| HH:MM | [fix applied] |
-| HH:MM | [alert resolved / service recovered] |
+- `monitoring/prometheus/prometheus.yml` — scrape configuration for Prometheus, Gateway, Events, and Payments.
+- `submissions/runbooks/redis-down.md` — second runbook for Redis unavailability.
+- `submissions/lab6.md` — this report.
 
-## Root Cause
-[Systemic cause — NOT "I changed the env var." Instead: "The payments service
-failure rate was increased to 50%, causing gateway to return 502 errors for
-all payment requests. This burned 5% of the weekly error budget in 10 minutes."]
+## 11. Final assessment against the lab rubric
 
-## What Went Well
-- [e.g., Alert fired within 3 minutes of failure]
-- [e.g., Runbook was clear and easy to follow]
+| Requirement | Status |
+|---|---|
+| Two Grafana-managed alert rules | Configured; High Error Rate failure/recovery behavior observed |
+| Contact point and notification policy | Configured; contact-point test succeeded |
+| High Error Rate runbook | Included in this report |
+| Failure injection and recovery | Completed and observed |
+| Alert timeline with exact timestamps | Partial: sequence documented; exact timestamps not captured |
+| Blameless postmortem | Included |
+| Second runbook | Included and manually tested by author |
+| Peer test and feedback update (bonus) | Not completed |
 
-## What Went Wrong
-- [e.g., Took 5 minutes to find the right dashboard]
-- [e.g., Runbook didn't cover this specific failure mode]
-
-## Action Items
-| Action | Owner | Priority |
-|--------|-------|----------|
-| [e.g., Add alert for payment latency spike] | [name] | High |
-| [e.g., Update runbook with env var check] | [name] | Medium |
-```
-
-**Important:** This is a **blameless** postmortem. Focus on **systems and processes**, not "I made a mistake." The question isn't "who broke it" but "how did the system allow this to happen?"
-
-**Paste into `submissions/lab6.md`:**
-- Full postmortem document
-- Answer: "What is the most important action item from your postmortem? Why?"
-
----
-
-## Bonus Task — Cross-Test Runbooks (2 pts)
-
-> 🌟 For those who want extra challenge and experience.
-
-**Objective:** Write a runbook for a *different* failure mode, and have a classmate test it.
-
-### B.1: Write a second runbook
-
-Choose a failure mode you haven't covered yet:
-- Redis down → reservations fail
-- PostgreSQL down → everything fails
-- Gateway timeout too short → intermittent failures under load
-- DB connection pool exhausted → events service degraded
-
-Write a runbook following the same structure as step 6.5.
-
-### B.2: Swap and test
-
-1. Give your runbook to a classmate (they should NOT know what failure you'll inject)
-2. Inject the failure in your stack
-3. Your classmate follows ONLY the runbook to diagnose and fix it
-4. Record: Did they succeed? How long did it take? What was unclear?
-
-**Paste into `submissions/lab6.md`:**
-- Your second runbook
-- Results: Did the classmate resolve it using only the runbook?
-- What they found unclear or missing → update the runbook based on feedback
-
----
-
-## How to Submit
-
-```bash
-git switch -c feature/lab6
-git add submissions/lab6.md
-git commit -m "feat(lab6): add alerting config, runbook, and postmortem"
-git push -u origin feature/lab6
-```
-
-PR checklist:
-```text
-- [x] Task 1 done — alerts created, incident simulated, runbook followed
-- [ ] Task 2 done — blameless postmortem written
-- [ ] Bonus Task done — cross-tested runbook with classmate
-```
-
----
-
-## Acceptance Criteria
-
-### Task 1 (6 pts)
-- ✅ Two alert rules created in Grafana (error rate + burn rate)
-- ✅ Contact point configured and tested
-- ✅ Runbook written with diagnosis + mitigation + escalation
-- ✅ Alert fired during failure injection (evidence provided)
-- ✅ Timeline recorded from injection to resolution
-- ✅ Written answer about alert delay
-
-### Task 2 (4 pts)
-- ✅ Full blameless postmortem following the template
-- ✅ Focus on systems, not blame
-- ✅ Action items are specific and assigned
-
-### Bonus Task (2 pts)
-- ✅ Second runbook for a different failure mode
-- ✅ Classmate tested it
-- ✅ Runbook updated based on feedback
-
----
-
-## Rubric
-
-| Task | Points | Criteria |
-|------|-------:|----------|
-| **Task 1** — Alerts + runbook + incident | **6** | Both alerts configured, runbook written, failure detected + resolved, timestamps documented |
-| **Task 2** — Blameless postmortem | **4** | Full postmortem, blameless tone, concrete action items |
-| **Bonus Task** — Cross-tested runbook | **2** | Second runbook, peer-tested, updated from feedback |
-| **Total** | **12** | 10 main + 2 bonus |
-
----
-
-## Resources
-
-<details>
-<summary>📚 Documentation</summary>
-
-- [Grafana Alerting docs](https://grafana.com/docs/grafana/latest/alerting/)
-- [Google SRE Workbook, Ch 5 — Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)
-- [PagerDuty Incident Response (open source)](https://response.pagerduty.com/)
-- [Google SRE Book, Ch 15 — Postmortem Culture](https://sre.google/sre-book/postmortem-culture/)
-
-</details>
-
-<details>
-<summary>⚠️ Common Pitfalls</summary>
-
-- **Alert never fires** — check: is loadgen running? Is the pending period too long? Is the PromQL query returning data?
-- **Alert fires immediately** — pending period too short, or threshold too low
-- **Notification not received** — test the contact point first (Grafana has a "Test" button)
-- **Burn rate query shows NaN** — not enough data in the window yet. Use the error rate alert for faster testing.
-- **Two compose files** — always run from `app/`: `docker compose -f docker-compose.yaml -f ../docker-compose.monitoring.yaml`
-
-</details>
+**Submission note:** The report intentionally distinguishes verified observations from missing evidence. To strengthen the submission before opening the PR, attach the actual Grafana/Prometheus screenshots and, if time permits, repeat the incident once while recording timestamps for each milestone.
